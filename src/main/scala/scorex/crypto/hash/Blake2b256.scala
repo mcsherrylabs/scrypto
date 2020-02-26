@@ -1,10 +1,8 @@
 package scorex.crypto.hash
 
-import ove.crypto.digest.Blake2b
-import scorex.crypto.hash.CryptographicHash.Message
+object Blake2b256 extends Blake2b[Digest32] with CryptographicHash32 {
+  override def hash(input: Message): Digest32 = Digest32 @@ internalHash(input)
 
-object Blake2b256 extends CryptographicHash {
-  override val DigestSize: Int = 32
-
-  override def hash(input: Message): Digest = Blake2b.Digest.newInstance(DigestSize).digest(input)
+  override def prefixedHash(prefix: Byte, inputs: Array[Byte]*): Digest32 =
+    Digest32 @@ internalPrefixedHash(prefix, inputs: _*)
 }

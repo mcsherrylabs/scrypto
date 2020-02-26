@@ -1,5 +1,11 @@
 package scorex.crypto.hash
 
-object Whirlpool extends FRHash {
-  override protected def hf: fr.cryptohash.Digest = new fr.cryptohash.Whirlpool
+import org.bouncycastle.crypto.digests.WhirlpoolDigest
+
+
+object Whirlpool extends BouncyCastleHash[Digest64] with CryptographicHash64 {
+
+  override protected lazy val digestFn = new WhirlpoolDigest
+
+  override def hash(input: Message): Digest64 = Digest64 @@ internalHash(input)
 }

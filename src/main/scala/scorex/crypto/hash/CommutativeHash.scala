@@ -1,13 +1,21 @@
 package scorex.crypto.hash
 
-import scorex.crypto.hash.CryptographicHash.Message
 import scorex.utils.ByteArray
 
-case class CommutativeHash[HashFn <: CryptographicHash](hf: HashFn) extends CryptographicHash {
+import scala.util.Try
+
+class CommutativeHash[D <: Digest](hf: CryptographicHash[D]) extends CryptographicHash[D] {
   override val DigestSize: Int = hf.DigestSize
 
-  override def hash(input: Message): Digest = hf.hash(input)
+  def apply(x: Message, y: Message): D = hash(x, y)
 
-  def hash(x: Message, y: Message): Digest = if (ByteArray.compare(x, y) > 0) hash(x ++ y) else hash(y ++ x)
+  def hash(x: Message, y: Message): D = hash(commutativeBytes(x, y))
 
+  override def hash(input: Message): D = hf.hash(input)
+
+  def prefixedHash(prefix: Byte, x: Message, y: Message): D = prefixedHash(prefix, commutativeBytes(x, y))
+
+  private def commutativeBytes(x: Message, y: Message): Message = if (ByteArray.compare(x, y) > 0) x ++ y else y ++ x
+
+  override def byteArrayToDigest(bytes: Array[Byte]): Try[D] = hf.byteArrayToDigest(bytes)
 }

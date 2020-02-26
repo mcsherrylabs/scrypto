@@ -1,138 +1,99 @@
 package scorex.crypto.authds.merkle
 
-import scorex.crypto.authds.storage.{BlobStorage, StorageType, VersionedStorage}
-import scorex.crypto.hash.{Blake2b256, CryptographicHash}
-import scorex.utils.ScryptoLogging
+import scorex.crypto.authds.{LeafData, Side}
+import scorex.crypto.hash._
 
 import scala.annotation.tailrec
 import scala.collection.mutable
-import scala.util.{Failure, Try}
 
+case class MerkleTree[D <: Digest](topNode: Node[D],
+                                   elementsHashIndex: Map[mutable.WrappedArray.ofByte, Int]) {
 
-trait MerkleTree[HashFn <: CryptographicHash, ST <: StorageType] extends ScryptoLogging {
+  lazy val rootHash: D = topNode.hash
+  lazy val length: Int = elementsHashIndex.size
 
-  import MerkleTree._
+  def proofByElement(element: Leaf[D]): Option[MerkleProof[D]] = proofByElementHash(element.hash)
 
-  protected type Level <: BlobStorage[ST]
-  protected type LevelId = Int
-
-  protected type LPos = (LevelId, Position)
-  type Digest = HashFn#Digest
-
-  val hashFunction: HashFn
-
-  //todo: change with precomputed table?
-
-  private lazy val emptyHash0 = hashFunction(Array[Byte]()).dropRight(1)
-
-  private lazy val emptyHashesCache = mutable.Map[LevelId, Digest]()
-
-  emptyHashesCache.put(0, emptyHash0)
-
-  private def emptyHashTreeRoot(height: LevelId): Digest = {
-    height match {
-      case 0 => emptyHash0
-      case _ =>
-        val h = emptyHashTreeRoot(height - 1)
-        hashFunction(h ++ h)
-    }
+  def proofByElementHash(hash: D): Option[MerkleProof[D]] = {
+    elementsHashIndex.get(new mutable.WrappedArray.ofByte(hash)).flatMap(i => proofByIndex(i))
   }
 
-  protected def emptyTreeHash(level: LevelId): Digest = {
-    emptyHashesCache.get(level) match {
-      case Some(hash) => hash
-      case None => emptyHashTreeRoot(level)
-    }
-  }
-
-
-  protected def createLevel(level: LevelId, versionOpt: Option[VersionedStorage[ST]#VersionTag]): Try[Level]
-
-  protected def getLevel(level: LevelId): Option[Level]
-
-  def size: Long
-
-  def height: Int = calculateRequiredLevel(size)
-
-  def rootHash: Digest = getHash((height, 0)).get
-
-  /**
-    * Return MerkleAuthData at position $index
-    */
-  def proofByIndex(index: Position): Option[MerklePath[HashFn]] = {
-    val nonEmptyBlocks = size
-
-    if (index < nonEmptyBlocks && index >= 0) {
-      @tailrec
-      def calculateTreePath(n: Position, currentLevel: Int, acc: Seq[Digest] = Seq()): Seq[Digest] = {
-        if (currentLevel < height) {
-          val hashOpt = if (n % 2 == 0) getHash((currentLevel, n + 1)) else getHash((currentLevel, n - 1))
-          hashOpt match {
-            case Some(h) =>
-              calculateTreePath(n / 2, currentLevel + 1, h +: acc)
-            case None if currentLevel == 0 && index == nonEmptyBlocks - 1 =>
-              calculateTreePath(n / 2, currentLevel + 1, emptyTreeHash(currentLevel) +: acc)
-            case None =>
-              log.error(s"Unable to get hash for lev=$currentLevel, position=$n")
-              acc.reverse
-          }
-        } else {
-          acc.reverse
-        }
-      }
-      Some(MerklePath(index, calculateTreePath(index, 0)))
-    } else {
-      None
-    }
-  }
-
-  protected def setTreeElement(key: LPos, value: Digest): Unit = Try {
-    getLevel(key._1).get.set(key._2, value)
-  }.recoverWith { case t: Throwable =>
-    log.warn("Failed to set key:" + key, t)
-    Failure(t)
-  }
-
-  protected def unsetTreeElement(key: LPos): Unit = Try {
-    getLevel(key._1).get.unset(key._2)
-  }.recoverWith { case t: Throwable =>
-    log.warn("Failed to set key:" + key, t)
-    Failure(t)
-  }
-
-  def getHash(key: LPos): Option[Digest] = {
-
-    val level = key._1
-
-    getLevel(level).get.get(key._2) match {
-      //todo: exception
-      case None =>
-        if (level > 0) {
-          val h1 = getHash((level - 1, key._2 * 2))
-          val h2 = getHash((level - 1, key._2 * 2 + 1))
-          val calculatedHash = (h1, h2) match {
-            case (Some(hash1), Some(hash2)) => hashFunction(hash1 ++ hash2)
-            case (Some(h), None) => hashFunction(h ++ emptyTreeHash(level - 1))
-            case (None, Some(h)) => hashFunction(emptyTreeHash(level - 1) ++ h)
-            case (None, None) => emptyTreeHash(level)
-          }
-          setTreeElement(key, calculatedHash)
-          Some(calculatedHash)
-        } else {
+  def proofByIndex(index: Int): Option[MerkleProof[D]] = if (index >= 0 && index < length) {
+    def loop(node: Node[D], i: Int, curLength: Int, acc: Seq[(D, Side)]): Option[(Leaf[D], Seq[(D, Side)])] = {
+      node match {
+        case n: InternalNode[D] if i < curLength / 2 =>
+          loop(n.left, i, curLength / 2, acc :+ (n.right.hash, MerkleProof.LeftSide))
+        case n: InternalNode[D] if i < curLength =>
+          loop(n.right, i - curLength / 2, curLength / 2, acc :+ (n.left.hash, MerkleProof.RightSide))
+        case n: Leaf[D] =>
+          Some((n, acc.reverse))
+        case _ =>
           None
-        }
-      case digest =>
-        digest
+      }
     }
+
+    val leafWithProofs = loop(topNode, index, lengthWithEmptyLeafs, Seq())
+    leafWithProofs.map(lp => MerkleProof(lp._1.data, lp._2)(lp._1.hf))
+  } else {
+    None
+  }
+
+  lazy val lengthWithEmptyLeafs: Int = {
+    def log2(x: Double): Double = math.log(x) / math.log(2)
+
+    Math.max(math.pow(2, math.ceil(log2(length))).toInt, 2)
+  }
+
+  //Debug only
+  override lazy val toString: String = {
+    def loop(nodes: Seq[Node[D]], level: Int, acc: String): String = {
+      if (nodes.nonEmpty) {
+        val thisLevStr = s"Level $level: " + nodes.map(_.toString).mkString(",") + "\n"
+        val nextLevNodes = nodes.flatMap {
+          case i: InternalNode[D] => Seq(i.left, i.right)
+          case _ => Seq()
+        }
+        loop(nextLevNodes, level + 1, acc + thisLevStr)
+      } else {
+        acc
+      }
+    }
+
+    loop(Seq(topNode), 0, "")
   }
 }
 
 object MerkleTree {
-  type Position = Long
-  val DefaultHashFunction = Blake2b256
+  val LeafPrefix: Byte = 0: Byte
+  val InternalNodePrefix: Byte = 1: Byte
 
-  def calculateRequiredLevel(numberOfDataBlocks: Position): Int = {
-    def log2(x: Double): Double = math.log(x) / math.log(2)
-    math.ceil(log2(numberOfDataBlocks)).toInt
+  /**
+    * Construct Merkle tree from leafs
+    *
+    * @param payload       - sequence of leafs data
+    * @param hf            - hash function
+    * @tparam D - hash function application type
+    * @return MerkleTree constructed from current leafs with defined empty node and hash function
+    */
+  def apply[D <: Digest](payload: Seq[LeafData])
+                        (implicit hf: CryptographicHash[D]): MerkleTree[D] = {
+    val leafs = payload.map(d => Leaf(d))
+    val elementsIndex: Map[mutable.WrappedArray.ofByte, Int] = leafs.indices.map { i =>
+      (new mutable.WrappedArray.ofByte(leafs(i).hash), i)
+    }.toMap
+    val topNode = calcTopNode[D](leafs)
+
+    MerkleTree(topNode, elementsIndex)
+  }
+
+  @tailrec
+  def calcTopNode[D <: Digest](nodes: Seq[Node[D]])(implicit hf: CryptographicHash[D]): Node[D] = {
+    if (nodes.isEmpty) {
+      EmptyRootNode[D]
+    } else {
+      val nextNodes = nodes.grouped(2)
+        .map(lr => InternalNode[D](lr.head, if (lr.lengthCompare(2) == 0) lr.last else EmptyNode[D])).toSeq
+      if (nextNodes.lengthCompare(1) == 0) nextNodes.head else calcTopNode(nextNodes)
+    }
   }
 }
